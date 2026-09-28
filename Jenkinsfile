@@ -1,119 +1,167 @@
-// Jenkinsfile — place at the ROOT of the repository (same level as /backend and /frontend)
-// Stack: Spring Boot 4.1 (Java 17, Maven) + Angular 22 (Node, npm)
-
-// Works on Linux (sh) and Windows (bat) agents
-def run(String cmd) {
-    if (isUnix()) { sh cmd } else { bat cmd }
-}
+// Jenkinsfile - ROOT of the repo (next to /backend, /frontend, docker-compose.yml)
+// Flow: Checkout -> Build -> Test (throwaway MySQL) -> SonarQube -> Docker build -> Deploy -> Verify
 
 pipeline {
     agent any
 
     // Names must match Manage Jenkins > Tools
     tools {
-        jdk    'JDK17'
-        maven  'Maven3'
-        nodejs 'NodeJS22'
+        jdk   'JDK17'
+        maven 'Maven3'
+    }
+
+    parameters {
+        booleanParam(name: 'RUN_QUALITY_GATE', defaultValue: false,
+                     description: 'Wait for the SonarQube Quality Gate (needs a SonarQube webhook to Jenkins)')
     }
 
     triggers {
-        githubPush()                       // GitHub webhook trigger
-        // pollSCM('H/5 * * * *')          // fallback if webhook can't reach Jenkins (e.g. localhost)
+        githubPush()
+        // pollSCM('H/5 * * * *')   // use this instead if GitHub cannot reach Jenkins
     }
 
     options {
         timestamps()
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '10'))
-        timeout(time: 30, unit: 'MINUTES')
+        timeout(time: 40, unit: 'MINUTES')
     }
 
     environment {
-        BACKEND_DIR  = 'backend'
-        FRONTEND_DIR = 'frontend'
-
-        // The Spring context test (@SpringBootTest) needs MySQL.
-        // These override application.properties (Spring relaxed binding).
-        SPRING_DATASOURCE_URL      = 'jdbc:mysql://localhost:3306/test_db?createDatabaseIfNotExist=true'
-        SPRING_DATASOURCE_USERNAME = 'root'
-        SPRING_DATASOURCE_PASSWORD = 'root'
+        COMPOSE_PROJECT_NAME = 'gestion-projets'
+        SONAR_PROJECT_KEY    = 'DevOps-AppGestionDesProjets'
+        TEST_DB_CONTAINER    = 'mysql-ci-test'
+        TEST_DB_PORT         = '3307'
     }
 
     stages {
 
         stage('Checkout') {
             steps {
-                checkout scm
-                script { run('java -version && mvn -version && node -v && npm -v') }
+                checkout scm      // code comes from GitHub, NOT from a hard-coded /home/... folder
             }
         }
 
-        stage('Backend - Build') {
+        stage('Check Environment') {
             steps {
-                dir(env.BACKEND_DIR) {
-                    script { run('mvn -B clean compile') }
+                sh '''
+                    echo "=== Jenkins user ===";  whoami
+                    echo "=== Java ===";          java -version
+                    echo "=== Maven ===";         mvn -version
+                    echo "=== Docker ===";        docker --version
+                    echo "=== Docker Compose ==="; docker compose version
+                '''
+            }
+        }
+
+        stage('Backend - Compile') {
+            steps {
+                dir('backend') {
+                    sh 'mvn -B clean compile'
                 }
             }
         }
 
         stage('Backend - Test') {
             steps {
-                dir(env.BACKEND_DIR) {
-                    script { run('mvn -B test') }
+                // Throwaway MySQL because @SpringBootTest needs a database
+                sh '''
+                    docker rm -f $TEST_DB_CONTAINER >/dev/null 2>&1 || true
+                    docker run -d --name $TEST_DB_CONTAINER \
+                        -e MYSQL_ROOT_PASSWORD=root -e MYSQL_DATABASE=test_db \
+                        -p 127.0.0.1:$TEST_DB_PORT:3306 mysql:8.0
+
+                    echo "Waiting for MySQL..."
+                    for i in $(seq 1 30); do
+                        docker exec $TEST_DB_CONTAINER mysqladmin ping -uroot -proot --silent && break
+                        sleep 3
+                    done
+                '''
+                dir('backend') {
+                    sh '''
+                        SPRING_DATASOURCE_URL="jdbc:mysql://127.0.0.1:$TEST_DB_PORT/test_db?allowPublicKeyRetrieval=true&useSSL=false" \
+                        SPRING_DATASOURCE_USERNAME=root \
+                        SPRING_DATASOURCE_PASSWORD=root \
+                        mvn -B test
+                    '''
                 }
             }
             post {
                 always {
-                    junit testResults: "${env.BACKEND_DIR}/target/surefire-reports/*.xml",
-                          allowEmptyResults: true
+                    junit testResults: 'backend/target/surefire-reports/*.xml', allowEmptyResults: true
+                    sh 'docker rm -f $TEST_DB_CONTAINER || true'
                 }
             }
         }
 
-        stage('Backend - Package') {
+        stage('SonarQube Analysis') {
             steps {
-                dir(env.BACKEND_DIR) {
-                    script { run('mvn -B package -DskipTests') }
+                script {
+                    def scannerHome = tool 'SonarScanner'
+                    withSonarQubeEnv('SonarQube') {
+                        // SONAR_AUTH_TOKEN and SONAR_HOST_URL are injected by withSonarQubeEnv
+                        sh """
+                            ${scannerHome}/bin/sonar-scanner \
+                              -Dsonar.projectKey=${SONAR_PROJECT_KEY} \
+                              -Dsonar.projectName=${SONAR_PROJECT_KEY} \
+                              -Dsonar.sources=backend/src/main/java,frontend/src \
+                              -Dsonar.tests=backend/src/test/java \
+                              -Dsonar.java.binaries=backend/target/classes \
+                              -Dsonar.exclusions=**/node_modules/**,**/target/**,**/dist/**,**/*.spec.ts \
+                              -Dsonar.token=\$SONAR_AUTH_TOKEN
+                        """
+                    }
                 }
             }
         }
 
-        stage('Frontend - Install') {
+        stage('Quality Gate') {
+            when { expression { params.RUN_QUALITY_GATE } }
             steps {
-                dir(env.FRONTEND_DIR) {
-                    script { run('npm ci') }
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
                 }
             }
         }
 
-        stage('Frontend - Test') {
+        stage('Build Images') {
             steps {
-                dir(env.FRONTEND_DIR) {
-                    script { run('npm test -- --watch=false') }
-                }
+                sh 'docker compose build'
             }
         }
 
-        stage('Frontend - Build') {
+        stage('Deploy') {
             steps {
-                dir(env.FRONTEND_DIR) {
-                    script { run('npm run build') }
-                }
+                // up -d recreates only what changed; DB volume is kept
+                sh 'docker compose up -d --remove-orphans'
             }
         }
 
-        stage('Archive') {
+        stage('Verify') {
             steps {
-                archiveArtifacts artifacts: "${env.BACKEND_DIR}/target/*.jar, ${env.FRONTEND_DIR}/dist/**",
-                                 fingerprint: true,
-                                 allowEmptyArchive: false
+                sh '''
+                    docker compose ps
+                    for i in $(seq 1 30); do
+                        if curl -sf http://localhost:8080/entreprise/all >/dev/null; then
+                            echo "Backend OK"
+                            curl -sf http://localhost:4200 >/dev/null && echo "Frontend OK"
+                            exit 0
+                        fi
+                        echo "Waiting for backend ($i/30)..."
+                        sleep 5
+                    done
+                    echo "Backend did not become healthy"
+                    exit 1
+                '''
             }
         }
     }
 
     post {
-        success { echo 'Pipeline succeeded.' }
-        failure { echo 'Pipeline failed - check the stage logs above.' }
-        cleanup { cleanWs() }
+        success { echo 'Analyse SonarQube et deploiement reussis.' }
+        failure {
+            echo 'Le pipeline a echoue.'
+            sh 'docker compose logs --tail=80 || true'
+        }
     }
 }
