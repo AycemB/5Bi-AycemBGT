@@ -144,7 +144,7 @@ pipeline {
                     for i in $(seq 1 30); do
                         if curl -sf http://localhost:8080/entreprise/all >/dev/null; then
                             echo "Backend OK"
-                            curl -sf http://localhost:4201 >/dev/null && echo "Frontend OK"
+                            curl -sf http://localhost:4300  >/dev/null && echo "Frontend OK"
                             exit 0
                         fi
                         echo "Waiting for backend ($i/30)..."
